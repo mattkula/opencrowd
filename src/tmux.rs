@@ -129,13 +129,22 @@ pub fn switch_client(session_name: &str) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct PaneLayout {
     pub tui_pane: String,
-    pub opencode_pane: String,
-    pub cli_pane: String,
+    pub opencode_pane: Option<String>,
+    pub cli_pane: Option<String>,
 }
 
-/// Create the 3-pane layout in the current window.
+/// Record the TUI pane. Right-side panes are created lazily via `ensure_right_panes`.
 pub fn create_layout() -> Result<PaneLayout> {
     let tui_pane = current_pane_id()?;
+    Ok(PaneLayout { tui_pane, opencode_pane: None, cli_pane: None })
+}
+
+/// Create the right-side panes if they don't exist yet.
+/// Returns the (opencode_pane, cli_pane) IDs.
+pub fn ensure_right_panes(layout: &mut PaneLayout) -> Result<()> {
+    if layout.opencode_pane.is_some() && layout.cli_pane.is_some() {
+        return Ok(());
+    }
 
     // Right pane for opencode (70% width)
     let output = Command::new("tmux")
@@ -143,7 +152,7 @@ pub fn create_layout() -> Result<PaneLayout> {
             "split-window", "-h", "-d",
             "-p", "70",
             "-P", "-F", "#{pane_id}",
-            "-t", &tui_pane,
+            "-t", &layout.tui_pane,
         ])
         .output()
         .context("Failed to create opencode pane")?;
@@ -175,10 +184,13 @@ pub fn create_layout() -> Result<PaneLayout> {
 
     // Focus on TUI
     let _ = Command::new("tmux")
-        .args(["select-pane", "-t", &tui_pane])
+        .args(["select-pane", "-t", &layout.tui_pane])
         .output();
 
-    Ok(PaneLayout { tui_pane, opencode_pane, cli_pane })
+    layout.opencode_pane = Some(opencode_pane);
+    layout.cli_pane = Some(cli_pane);
+
+    Ok(())
 }
 
 // ===========================================================================
@@ -264,16 +276,22 @@ fn attach_pane_to_session(pane_id: &str, session_name: &str) -> Result<()> {
 }
 
 /// Show a feature in the outer right panes.
+/// The layout must have right panes created (call `ensure_right_panes` first).
 pub fn show_feature(layout: &PaneLayout, repo_name: &str, feature_name: &str) -> Result<()> {
     let oc_session = opencode_session_name(repo_name, feature_name);
     let cli_session = cli_session_name(repo_name, feature_name);
 
-    attach_pane_to_session(&layout.opencode_pane, &oc_session)?;
-    attach_pane_to_session(&layout.cli_pane, &cli_session)?;
+    let opencode_pane = layout.opencode_pane.as_ref()
+        .context("Right panes not created yet")?;
+    let cli_pane = layout.cli_pane.as_ref()
+        .context("Right panes not created yet")?;
 
-    // Keep focus on TUI
+    attach_pane_to_session(opencode_pane, &oc_session)?;
+    attach_pane_to_session(cli_pane, &cli_session)?;
+
+    // Focus the opencode pane so the user can start interacting
     let _ = Command::new("tmux")
-        .args(["select-pane", "-t", &layout.tui_pane])
+        .args(["select-pane", "-t", opencode_pane])
         .output();
 
     Ok(())
@@ -282,12 +300,16 @@ pub fn show_feature(layout: &PaneLayout, repo_name: &str, feature_name: &str) ->
 /// Clear the right panes (empty shells).
 pub fn clear_feature(layout: &PaneLayout) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let _ = Command::new("tmux")
-        .args(["respawn-pane", "-k", "-t", &layout.opencode_pane, "-c", &home])
-        .output();
-    let _ = Command::new("tmux")
-        .args(["respawn-pane", "-k", "-t", &layout.cli_pane, "-c", &home])
-        .output();
+    if let Some(ref pane) = layout.opencode_pane {
+        let _ = Command::new("tmux")
+            .args(["respawn-pane", "-k", "-t", pane, "-c", &home])
+            .output();
+    }
+    if let Some(ref pane) = layout.cli_pane {
+        let _ = Command::new("tmux")
+            .args(["respawn-pane", "-k", "-t", pane, "-c", &home])
+            .output();
+    }
     Ok(())
 }
 
@@ -326,6 +348,22 @@ pub fn kill_all_inner_sessions(repo_name: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Capture the visible text of a feature's opencode inner session pane.
+pub fn capture_opencode_pane(repo_name: &str, feature_name: &str) -> Result<String> {
+    let session = opencode_session_name(repo_name, feature_name);
+    let output = Command::new("tmux")
+        .args(["capture-pane", "-t", &session, "-p"])
+        .output()
+        .context("Failed to capture pane")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("Failed to capture pane: {}", stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Kill the outer opencrowd tmux session (the one we're running in).

@@ -2,6 +2,7 @@ mod app;
 mod git;
 mod model;
 mod persist;
+mod status;
 mod tmux;
 mod ui;
 
@@ -153,13 +154,22 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
         }
 
         if app.should_quit_and_kill {
-            // Kill all inner sessions for this repo, then kill the outer session.
-            // Killing the outer session terminates our process, so this won't return.
+            // Restore the terminal before killing sessions so the parent
+            // terminal isn't left in a broken state (raw mode / alt screen).
+            disable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            )?;
+            terminal.show_cursor()?;
+
+            // Now kill all inner sessions, then the outer tmux session.
             let repo_name = app.state.repo_name.clone();
             let _ = tmux::kill_all_inner_sessions(&repo_name);
             let _ = tmux::kill_outer_session(&repo_name);
-            // If kill_outer_session didn't terminate us (shouldn't happen), exit cleanly
-            return Ok(());
+            // kill_outer_session terminates our process; this is a fallback
+            std::process::exit(0);
         }
 
         if app.should_detach {
@@ -173,6 +183,9 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
             app.should_detach = false;
             continue;
         }
+
+        // Poll feature statuses periodically (throttled to every ~2s)
+        app.poll_statuses();
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {

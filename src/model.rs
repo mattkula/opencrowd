@@ -4,18 +4,20 @@ use std::fmt;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum FeatureStatus {
-    Active,
+    #[serde(alias = "Active")]
+    Working,
     WaitingForInput,
-    Completed,
+    #[serde(alias = "Completed")]
+    Idle,
     Stopped,
 }
 
 impl fmt::Display for FeatureStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FeatureStatus::Active => write!(f, "Active"),
+            FeatureStatus::Working => write!(f, "Working"),
             FeatureStatus::WaitingForInput => write!(f, "Waiting"),
-            FeatureStatus::Completed => write!(f, "Done"),
+            FeatureStatus::Idle => write!(f, "Idle"),
             FeatureStatus::Stopped => write!(f, "Stopped"),
         }
     }
@@ -24,18 +26,18 @@ impl fmt::Display for FeatureStatus {
 impl FeatureStatus {
     pub fn symbol(&self) -> &str {
         match self {
-            FeatureStatus::Active => ">>",
+            FeatureStatus::Working => ">>",
             FeatureStatus::WaitingForInput => "??",
-            FeatureStatus::Completed => "ok",
+            FeatureStatus::Idle => "ok",
             FeatureStatus::Stopped => "--",
         }
     }
 
     pub fn color(&self) -> ratatui::style::Color {
         match self {
-            FeatureStatus::Active => ratatui::style::Color::Green,
+            FeatureStatus::Working => ratatui::style::Color::Green,
             FeatureStatus::WaitingForInput => ratatui::style::Color::Yellow,
-            FeatureStatus::Completed => ratatui::style::Color::Cyan,
+            FeatureStatus::Idle => ratatui::style::Color::Cyan,
             FeatureStatus::Stopped => ratatui::style::Color::DarkGray,
         }
     }
@@ -62,7 +64,7 @@ impl Feature {
             name,
             branch,
             worktree_path,
-            status: FeatureStatus::Active,
+            status: FeatureStatus::Idle,
             created_at: Utc::now(),
             description: None,
         }

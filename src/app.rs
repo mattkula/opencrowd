@@ -1,8 +1,11 @@
+use std::time::Instant;
+
 use anyhow::Result;
 
 use crate::git;
 use crate::model::{AppState, Feature, FeatureStatus};
 use crate::persist;
+use crate::status;
 use crate::tmux::{self, PaneLayout};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,7 +29,12 @@ pub struct App {
     /// Name of the feature currently displayed in the right-side panes.
     pub active_feature: Option<String>,
     pub delete_candidate: Option<usize>,
+    /// Timestamp of the last status poll, used to throttle polling to every ~2s.
+    pub last_status_poll: Instant,
 }
+
+/// How often to poll feature statuses.
+const STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl App {
     pub fn new(state: AppState) -> Self {
@@ -42,6 +50,7 @@ impl App {
             layout: None,
             active_feature: None,
             delete_candidate: None,
+            last_status_poll: Instant::now(),
         }
     }
 
@@ -129,8 +138,8 @@ impl App {
     /// Switching features just respawns those panes with a new attach command —
     /// the old inner session detaches and keeps running, the new one attaches.
     pub fn open_selected(&mut self) -> Result<()> {
-        let layout = match &self.layout {
-            Some(l) => l.clone(),
+        let layout = match &mut self.layout {
+            Some(l) => l,
             None => {
                 self.status_message = Some("No tmux layout available".to_string());
                 return Ok(());
@@ -153,12 +162,15 @@ impl App {
         // Ensure the inner sessions exist (might need recreation after reboot)
         if !tmux::inner_sessions_alive(&self.state.repo_name, &feature_name) {
             tmux::create_inner_sessions(&self.state.repo_name, &feature_name, &feature.worktree_path)?;
-            self.state.features[idx].status = FeatureStatus::Active;
+            self.state.features[idx].status = FeatureStatus::Idle;
             persist::save_state(&self.state)?;
         }
 
+        // Create right-side panes on first use
+        tmux::ensure_right_panes(layout)?;
+
         // Respawn the right-side panes to attach to this feature's inner session
-        tmux::show_feature(&layout, &self.state.repo_name, &feature_name)?;
+        tmux::show_feature(layout, &self.state.repo_name, &feature_name)?;
 
         self.active_feature = Some(feature_name.clone());
         self.status_message = Some(format!("Opened '{}'", feature_name));
@@ -251,17 +263,42 @@ impl App {
     /// Reconcile persisted state with actual worktrees/sessions on startup.
     pub fn reconcile(&mut self) {
         for feature in &mut self.state.features {
-            if !std::path::Path::new(&feature.worktree_path).exists() {
-                feature.status = FeatureStatus::Stopped;
-                continue;
-            }
+            feature.status = status::detect_status(
+                &self.state.repo_name,
+                &feature.name,
+                &feature.worktree_path,
+            );
+        }
+    }
 
-            if tmux::inner_sessions_alive(&self.state.repo_name, &feature.name) {
-                feature.status = FeatureStatus::Active;
-            } else {
-                // Worktree exists but no tmux session — will be recreated on open
-                feature.status = FeatureStatus::Stopped;
+    /// Poll feature statuses if enough time has elapsed since the last poll.
+    /// Returns true if any status changed (caller should trigger a redraw).
+    pub fn poll_statuses(&mut self) -> bool {
+        if self.last_status_poll.elapsed() < STATUS_POLL_INTERVAL {
+            return false;
+        }
+        self.last_status_poll = Instant::now();
+
+        let mut changed = false;
+        let repo_name = self.state.repo_name.clone();
+
+        for feature in &mut self.state.features {
+            let new_status = status::detect_status(
+                &repo_name,
+                &feature.name,
+                &feature.worktree_path,
+            );
+
+            if feature.status != new_status {
+                feature.status = new_status;
+                changed = true;
             }
         }
+
+        if changed {
+            let _ = persist::save_state(&self.state);
+        }
+
+        changed
     }
 }
