@@ -33,6 +33,8 @@ pub struct App {
     pub last_status_poll: Instant,
     /// Animation frame counter for spinner, incremented each render tick.
     pub spinner_frame: usize,
+    /// Whether the TUI pane currently has tmux focus.
+    pub tui_focused: bool,
 }
 
 /// How often to poll feature statuses.
@@ -54,6 +56,7 @@ impl App {
             delete_candidate: None,
             last_status_poll: Instant::now(),
             spinner_frame: 0,
+            tui_focused: true,
         }
     }
 

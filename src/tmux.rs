@@ -56,6 +56,16 @@ fn current_pane_id() -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Check if the given pane is currently the active (focused) pane.
+pub fn is_pane_active(pane_id: &str) -> bool {
+    Command::new("tmux")
+        .args(["display-message", "-t", pane_id, "-p", "#{pane_active}"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+        .unwrap_or(false)
+}
+
 pub fn detach_client() -> Result<()> {
     let _ = Command::new("tmux")
         .args(["detach-client"])

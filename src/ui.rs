@@ -89,6 +89,14 @@ fn draw_feature_list(f: &mut Frame, app: &App, area: Rect) {
     let feature_count = app.state.features.len();
     let title = format!(" Features ({}) ", feature_count);
 
+    let highlight_style = if app.tui_focused {
+        Style::default().bg(Color::Rgb(30, 30, 30))
+    } else {
+        Style::default()
+    };
+
+    let highlight_symbol = if app.tui_focused { ">" } else { " " };
+
     let list = List::new(items)
         .block(
             Block::default()
@@ -96,11 +104,8 @@ fn draw_feature_list(f: &mut Frame, app: &App, area: Rect) {
                 .title(title)
                 .border_style(Style::default().fg(Color::Blue)),
         )
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(30, 30, 30)),
-        )
-        .highlight_symbol(">");
+        .highlight_style(highlight_style)
+        .highlight_symbol(highlight_symbol);
 
     let mut list_state = ListState::default();
     if !app.state.features.is_empty() {

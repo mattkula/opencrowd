@@ -152,6 +152,11 @@ fn tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
         // Advance spinner each frame (~250ms per tick = 4 fps)
         app.spinner_frame = app.spinner_frame.wrapping_add(1);
 
+        // Check if TUI pane has tmux focus
+        if let Some(ref layout) = app.layout {
+            app.tui_focused = tmux::is_pane_active(&layout.tui_pane);
+        }
+
         if app.should_quit {
             return Ok(());
         }
