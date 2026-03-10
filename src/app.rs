@@ -31,6 +31,8 @@ pub struct App {
     pub delete_candidate: Option<usize>,
     /// Timestamp of the last status poll, used to throttle polling to every ~2s.
     pub last_status_poll: Instant,
+    /// Animation frame counter for spinner, incremented each render tick.
+    pub spinner_frame: usize,
 }
 
 /// How often to poll feature statuses.
@@ -51,6 +53,7 @@ impl App {
             active_feature: None,
             delete_candidate: None,
             last_status_poll: Instant::now(),
+            spinner_frame: 0,
         }
     }
 

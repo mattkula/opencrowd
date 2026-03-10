@@ -47,7 +47,7 @@ fn draw_feature_list(f: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, feature)| {
             let status_color = feature.status.color();
-            let symbol = feature.status.symbol();
+            let symbol = feature.status.symbol(app.spinner_frame);
             let is_active = app.active_feature.as_ref() == Some(&feature.name);
 
             let selected = i == app.selected_index;
@@ -136,7 +136,7 @@ fn draw_detail_panel(f: &mut Frame, app: &App, area: Rect) {
             Line::from(vec![
                 Span::styled(" Status:   ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    format!("[{}] {}", feature.status.symbol(), feature.status),
+                    format!("[{}] {}", feature.status.symbol(app.spinner_frame), feature.status),
                     Style::default().fg(status_color),
                 ),
             ]),

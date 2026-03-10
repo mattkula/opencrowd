@@ -23,13 +23,15 @@ impl fmt::Display for FeatureStatus {
     }
 }
 
+const SPINNER_FRAMES: &[&str] = &["|", "/", "-", "\\"];
+
 impl FeatureStatus {
-    pub fn symbol(&self) -> &str {
+    pub fn symbol(&self, frame: usize) -> &str {
         match self {
-            FeatureStatus::Working => ">>",
-            FeatureStatus::WaitingForInput => "??",
-            FeatureStatus::Idle => "ok",
-            FeatureStatus::Stopped => "--",
+            FeatureStatus::Working => SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
+            FeatureStatus::WaitingForInput => "???",
+            FeatureStatus::Idle => "zZz",
+            FeatureStatus::Stopped => "---",
         }
     }
 
