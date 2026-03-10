@@ -40,51 +40,86 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_feature_list(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .state
-        .features
-        .iter()
-        .enumerate()
-        .map(|(i, feature)| {
-            let status_color = feature.status.color();
-            let symbol = feature.status.symbol(app.spinner_frame);
-            let is_active = app.active_feature.as_ref() == Some(&feature.name);
+    let mut items: Vec<ListItem> = Vec::new();
 
-            let selected = i == app.selected_index;
-            let name_style = if is_active {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            } else if selected {
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
+    // Base entry (always index 0)
+    {
+        let is_active = app.active_feature.as_deref() == Some("base");
+        let status_color = app.base_status.color();
+        let symbol = app.base_status.symbol(app.spinner_frame);
+        let selected = app.selected_index == 0;
+        let name_style = if is_active {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else if selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let active_indicator = if is_active { " <" } else { "" };
 
-            // Show an arrow for the active feature (the one in the right panes)
-            let active_indicator = if is_active { " <" } else { "" };
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" [{}] ", symbol),
+                Style::default().fg(status_color),
+            ),
+            Span::styled("base", name_style),
+            Span::styled(
+                format!("  {}", app.state.base_repo_path),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                active_indicator,
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+        ]);
 
-            let line = Line::from(vec![
-                Span::styled(
-                    format!(" [{}] ", symbol),
-                    Style::default().fg(status_color),
-                ),
-                Span::styled(&feature.name, name_style),
-                Span::styled(
-                    format!("  {}", feature.branch),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    active_indicator,
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                ),
-            ]);
+        items.push(ListItem::new(line));
+    }
 
-            ListItem::new(line)
-        })
-        .collect();
+    // Feature entries (index 1+)
+    for (i, feature) in app.state.features.iter().enumerate() {
+        let display_idx = i + 1;
+        let status_color = feature.status.color();
+        let symbol = feature.status.symbol(app.spinner_frame);
+        let is_active = app.active_feature.as_ref() == Some(&feature.name);
+
+        let selected = display_idx == app.selected_index;
+        let name_style = if is_active {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else if selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        let active_indicator = if is_active { " <" } else { "" };
+
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" [{}] ", symbol),
+                Style::default().fg(status_color),
+            ),
+            Span::styled(&feature.name, name_style),
+            Span::styled(
+                format!("  {}", feature.branch),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                active_indicator,
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+
+        items.push(ListItem::new(line));
+    }
 
     let feature_count = app.state.features.len();
     let title = format!(" Features ({}) ", feature_count);
@@ -108,15 +143,50 @@ fn draw_feature_list(f: &mut Frame, app: &App, area: Rect) {
         .highlight_symbol(highlight_symbol);
 
     let mut list_state = ListState::default();
-    if !app.state.features.is_empty() {
-        list_state.select(Some(app.selected_index));
-    }
+    list_state.select(Some(app.selected_index));
 
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
 fn draw_detail_panel(f: &mut Frame, app: &App, area: Rect) {
-    if let Some(feature) = app.selected_feature() {
+    if app.is_base_selected() {
+        let is_active = app.active_feature.as_deref() == Some("base");
+        let status_color = app.base_status.color();
+
+        let lines = vec![
+            Line::from(vec![
+                Span::styled(" Name:     ", Style::default().fg(Color::DarkGray)),
+                Span::styled("base", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                if is_active {
+                    Span::styled("  [showing in panes]", Style::default().fg(Color::Green))
+                } else {
+                    Span::styled("  [press Enter to open]", Style::default().fg(Color::DarkGray))
+                },
+            ]),
+            Line::from(vec![
+                Span::styled(" Path:     ", Style::default().fg(Color::DarkGray)),
+                Span::styled(&app.state.base_repo_path, Style::default().fg(Color::Gray)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Status:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("[{}] {}", app.base_status.symbol(app.spinner_frame), app.base_status),
+                    Style::default().fg(status_color),
+                ),
+            ]),
+        ];
+
+        let detail = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Details ")
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .wrap(Wrap { trim: false });
+
+        f.render_widget(detail, area);
+    } else if let Some(feature) = app.selected_feature() {
         let status_color = feature.status.color();
         let is_active = app.active_feature.as_ref() == Some(&feature.name);
 
