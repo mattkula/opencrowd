@@ -1,16 +1,93 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use rusqlite::Connection;
 
 use crate::model::FeatureStatus;
 use crate::tmux;
 
+/// How often to refresh the worktree→session-ID mapping from the database.
+/// Session IDs rarely change, so 30 seconds is plenty.
+const SESSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+// ===========================================================================
+// Persistent status-detection context
+// ===========================================================================
+
+/// Holds a reusable SQLite connection and a cache of worktree→session-ID
+/// mappings so that status polling doesn't re-open the database or re-scan
+/// the session table on every cycle.
+pub struct StatusContext {
+    /// Persistent read-only connection to the opencode database.
+    conn: Option<Connection>,
+    /// Path we opened the connection from (so we can detect if it changes).
+    db_path: Option<PathBuf>,
+    /// Map from worktree path → opencode session ID.
+    session_cache: HashMap<String, String>,
+    /// When the session cache was last refreshed.
+    cache_refreshed: Instant,
+}
+
+impl StatusContext {
+    pub fn new() -> Self {
+        let db_path = opencode_db_path();
+        let conn = db_path.as_ref().and_then(|p| open_readonly(p));
+
+        StatusContext {
+            conn,
+            db_path,
+            session_cache: HashMap::new(),
+            cache_refreshed: Instant::now() - SESSION_CACHE_TTL, // force initial refresh
+        }
+    }
+
+    /// Refresh the session-ID cache if the TTL has elapsed.
+    /// Call this once per poll cycle, *before* calling `detect_status` for
+    /// each feature.
+    pub fn refresh_session_cache(&mut self, worktree_paths: &[&str]) {
+        if self.cache_refreshed.elapsed() < SESSION_CACHE_TTL {
+            return;
+        }
+
+        // Make sure the connection is alive. If the DB didn't exist at
+        // startup but does now, try opening it.
+        self.ensure_connection();
+
+        if let Some(ref conn) = self.conn {
+            self.session_cache = build_session_cache(conn, worktree_paths);
+        }
+        self.cache_refreshed = Instant::now();
+    }
+
+    /// Force-invalidate a single worktree's cached session ID (e.g. after a
+    /// new opencode session is created for that worktree).
+    #[allow(dead_code)]
+    pub fn invalidate(&mut self, worktree_path: &str) {
+        self.session_cache.remove(worktree_path);
+    }
+
+    /// Ensure the SQLite connection is open, re-opening if necessary.
+    fn ensure_connection(&mut self) {
+        // If we already have a connection, check it's still valid.
+        if self.conn.is_some() {
+            return;
+        }
+
+        // Try (re)opening.
+        let path = opencode_db_path();
+        if let Some(ref p) = path {
+            self.conn = open_readonly(p);
+            self.db_path = path;
+        }
+    }
+}
+
+// ===========================================================================
+// Database helpers
+// ===========================================================================
+
 /// Find the global opencode database.
-///
-/// opencode uses XDG conventions (~/.local/share/opencode/opencode.db)
-/// regardless of platform, so we check that first. Fall back to the
-/// platform-native data dir (~/Library/Application Support on macOS)
-/// in case a future version changes this.
 fn opencode_db_path() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
 
@@ -29,122 +106,151 @@ fn opencode_db_path() -> Option<PathBuf> {
     None
 }
 
+/// Open the database read-only so we never block opencode's writes.
+fn open_readonly(path: &PathBuf) -> Option<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+
+    // Busy timeout in case of WAL checkpoints.
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(50));
+
+    Some(conn)
+}
+
+/// Build a map from worktree path → most-recent opencode session ID for all
+/// given worktree paths in a **single query**.
+fn build_session_cache(conn: &Connection, worktree_paths: &[&str]) -> HashMap<String, String> {
+    let mut cache = HashMap::new();
+
+    if worktree_paths.is_empty() {
+        return cache;
+    }
+
+    // Build a single query with placeholders for all paths.  SQLite handles
+    // up to 999 bind parameters by default; we're unlikely to exceed that.
+    let placeholders: Vec<&str> = worktree_paths.iter().map(|_| "?").collect();
+    let sql = format!(
+        "SELECT s.directory, s.id
+         FROM session s
+         INNER JOIN (
+             SELECT directory, MAX(time_updated) AS max_tu
+             FROM session
+             WHERE directory IN ({})
+             GROUP BY directory
+         ) latest ON s.directory = latest.directory AND s.time_updated = latest.max_tu",
+        placeholders.join(",")
+    );
+
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return cache,
+    };
+
+    let params: Vec<&dyn rusqlite::types::ToSql> = worktree_paths
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    if let Ok(mut rows) = stmt.query(params.as_slice()) {
+        while let Ok(Some(row)) = rows.next() {
+            if let (Ok(dir), Ok(id)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                cache.insert(dir, id);
+            }
+        }
+    }
+
+    cache
+}
+
 // ===========================================================================
 // Public API
 // ===========================================================================
 
-/// Detect the current status of a feature by inspecting its tmux session
-/// and opencode database.
+/// Detect the current status of a feature.
 ///
-/// Priority order:
-///   1. Is the inner tmux session alive? If not -> Stopped.
-///   2. Capture the pane — check for any UI that needs user attention
-///      (permission dialog, question prompt) -> WaitingForInput.
-///   3. Query the global opencode SQLite DB for the latest message in the
-///      most recent session whose directory matches the worktree path.
-///   4. If the DB query returns no data but session is alive, use pane
-///      heuristics as a fallback.
-///   5. Fall back to Working if session is alive but we can't determine more.
-pub fn detect_status(repo_name: &str, feature_name: &str, worktree_path: &str) -> FeatureStatus {
-    // 1. Session alive?
-    if !tmux::inner_sessions_alive(repo_name, feature_name) {
+/// Accepts pre-fetched data to avoid redundant work:
+///   - `live_sessions`: set of currently alive tmux session names (from a
+///     single `tmux list-sessions` call).
+///   - `ctx`: persistent status context with DB connection and session cache.
+pub fn detect_status(
+    repo_name: &str,
+    feature_name: &str,
+    worktree_path: &str,
+    live_sessions: &HashSet<String>,
+    ctx: &StatusContext,
+) -> FeatureStatus {
+    // 1. Session alive?  O(1) lookup in the pre-fetched set.
+    let oc_session = tmux::opencode_session_name(repo_name, feature_name);
+    if !live_sessions.contains(&oc_session) {
         return FeatureStatus::Stopped;
     }
 
-    // 2. Capture the pane text (reused for all pane-based checks)
+    // 2. Capture the pane text (single subprocess per feature — unavoidable).
     let pane_text = tmux::capture_opencode_pane(repo_name, feature_name).ok();
 
-    // Check if opencode needs user input (permission dialog or question prompt).
-    // This must happen BEFORE the DB check because the DB will show the agent
-    // as "active" (no finish reason) in both "streaming" and "waiting for
-    // answer" states — only the pane UI distinguishes them.
+    // Check if opencode needs user input (must happen before DB check).
     if let Some(ref text) = pane_text {
         if needs_user_input(text) {
             return FeatureStatus::WaitingForInput;
         }
     }
 
-    // 3. Query the global opencode SQLite database
-    if let Some(db_path) = opencode_db_path() {
-        if let Some(status) = query_opencode_db(&db_path, worktree_path) {
-            return status;
+    // 3. Query the database using the cached session ID.
+    if let Some(ref conn) = ctx.conn {
+        if let Some(session_id) = ctx.session_cache.get(worktree_path) {
+            if let Some(status) = query_latest_message(conn, session_id) {
+                return status;
+            }
         }
     }
 
-    // 4. DB had no data — fall back to pane heuristics
+    // 4. DB had no data — fall back to pane heuristics.
     if let Some(ref text) = pane_text {
         return detect_from_pane(text);
     }
 
-    // 5. Session is alive but no further info — assume working
+    // 5. Session is alive but no further info — assume working.
     FeatureStatus::Working
 }
 
 // ===========================================================================
-// Pane text analysis (tmux capture-pane)
+// Pane text analysis
 // ===========================================================================
 
-/// Check if opencode is showing any UI that requires user input.
-///
-/// This covers two cases:
-///   - **Permission dialog**: opencode asks to "Allow" / "Deny" a tool execution.
-///   - **Question prompt**: the agent asked the user a question, showing a
-///     selection UI with "↑↓ select  enter submit  esc dismiss" at the bottom.
 fn needs_user_input(pane_text: &str) -> bool {
-    // Question prompt: the agent used the question tool and is waiting for
-    // the user to select an answer. The selection UI footer is unique enough
-    // to avoid false positives.
     if pane_text.contains("esc dismiss") {
         return true;
     }
-
-    // Permission dialog: opencode wants to run a tool and needs approval.
     if pane_text.contains("Allow") && pane_text.contains("Deny") {
         return true;
     }
-
     false
 }
 
-/// Detect status from captured pane text when the DB has no data.
 fn detect_from_pane(pane_text: &str) -> FeatureStatus {
-    // The status bar at the very bottom contains "ctrl+p" when the TUI is
-    // in its normal interactive mode (not during streaming).
     let has_command_hint = pane_text.contains("ctrl+p");
-
-    // The filled square character (▣) appears after a completed assistant
-    // turn (the model attribution line). During streaming it doesn't exist
-    // yet for the current response.
     let has_completed_marker = pane_text.contains('\u{25A3}');
 
     if has_command_hint && has_completed_marker {
         return FeatureStatus::Idle;
     }
-
-    // ctrl+p visible but no completed marker — opencode loaded, no conversation yet
     if has_command_hint {
         return FeatureStatus::Idle;
     }
-
     FeatureStatus::Working
 }
 
 // ===========================================================================
-// SQLite database query
+// SQLite: query latest message for a known session ID
 // ===========================================================================
 
-/// Query the global opencode database for the latest message in the most
-/// recent session whose directory matches the given worktree path.
-fn query_opencode_db(db_path: &PathBuf, worktree_path: &str) -> Option<FeatureStatus> {
-    let conn = Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
-
-    // Busy timeout so we don't fail if opencode is mid-write
-    let _ = conn.busy_timeout(std::time::Duration::from_millis(100));
-
+/// Query the latest message for a specific session ID.  This is a simple
+/// indexed lookup (by session_id) + ORDER BY + LIMIT 1 — fast even on large
+/// databases.
+fn query_latest_message(conn: &Connection, session_id: &str) -> Option<FeatureStatus> {
     let result: Option<(String, Option<String>, Option<i64>)> = conn
         .query_row(
             "SELECT
@@ -152,15 +258,10 @@ fn query_opencode_db(db_path: &PathBuf, worktree_path: &str) -> Option<FeatureSt
                 json_extract(m.data, '$.finish'),
                 json_extract(m.data, '$.time.completed')
              FROM message m
-             WHERE m.session_id = (
-                SELECT s.id FROM session s
-                WHERE s.directory = ?1
-                ORDER BY s.time_updated DESC
-                LIMIT 1
-             )
+             WHERE m.session_id = ?1
              ORDER BY m.time_created DESC
              LIMIT 1",
-            [worktree_path],
+            [session_id],
             |row| {
                 let role: String = row.get(0)?;
                 let finish: Option<String> = row.get(1)?;
@@ -173,28 +274,14 @@ fn query_opencode_db(db_path: &PathBuf, worktree_path: &str) -> Option<FeatureSt
     let (role, finish, completed) = result?;
 
     match role.as_str() {
-        "assistant" => {
-            match (finish.as_deref(), completed) {
-                (Some("stop"), Some(_)) | (Some("end_turn"), Some(_)) => {
-                    Some(FeatureStatus::Idle)
-                }
-                (Some("tool-calls"), _) => {
-                    Some(FeatureStatus::Working)
-                }
-                (None, None) => {
-                    Some(FeatureStatus::Working)
-                }
-                (_, Some(_)) => {
-                    Some(FeatureStatus::Idle)
-                }
-                (Some(_), None) => {
-                    Some(FeatureStatus::Idle)
-                }
-            }
-        }
-        "user" => {
-            Some(FeatureStatus::Working)
-        }
+        "assistant" => match (finish.as_deref(), completed) {
+            (Some("stop"), Some(_)) | (Some("end_turn"), Some(_)) => Some(FeatureStatus::Idle),
+            (Some("tool-calls"), _) => Some(FeatureStatus::Working),
+            (None, None) => Some(FeatureStatus::Working),
+            (_, Some(_)) => Some(FeatureStatus::Idle),
+            (Some(_), None) => Some(FeatureStatus::Idle),
+        },
+        "user" => Some(FeatureStatus::Working),
         _ => None,
     }
 }

@@ -67,9 +67,7 @@ pub fn is_pane_active(pane_id: &str) -> bool {
 }
 
 pub fn detach_client() -> Result<()> {
-    let _ = Command::new("tmux")
-        .args(["detach-client"])
-        .output();
+    let _ = Command::new("tmux").args(["detach-client"]).output();
     Ok(())
 }
 
@@ -77,12 +75,19 @@ pub fn detach_client() -> Result<()> {
 // Outer session bootstrap (auto-launch into tmux)
 // ===========================================================================
 
-pub fn create_session_and_attach(session_name: &str, working_dir: &str, command: &str) -> Result<()> {
+pub fn create_session_and_attach(
+    session_name: &str,
+    working_dir: &str,
+    command: &str,
+) -> Result<()> {
     let output = Command::new("tmux")
         .args([
-            "new-session", "-d",
-            "-s", session_name,
-            "-c", working_dir,
+            "new-session",
+            "-d",
+            "-s",
+            session_name,
+            "-c",
+            working_dir,
             command,
         ])
         .output()
@@ -146,7 +151,11 @@ pub struct PaneLayout {
 /// Record the TUI pane. Right-side panes are created lazily via `ensure_right_panes`.
 pub fn create_layout() -> Result<PaneLayout> {
     let tui_pane = current_pane_id()?;
-    Ok(PaneLayout { tui_pane, opencode_pane: None, cli_pane: None })
+    Ok(PaneLayout {
+        tui_pane,
+        opencode_pane: None,
+        cli_pane: None,
+    })
 }
 
 /// Create the right-side panes if they don't exist yet.
@@ -159,10 +168,16 @@ pub fn ensure_right_panes(layout: &mut PaneLayout) -> Result<()> {
     // Right pane for opencode (70% width)
     let output = Command::new("tmux")
         .args([
-            "split-window", "-h", "-d",
-            "-p", "70",
-            "-P", "-F", "#{pane_id}",
-            "-t", &layout.tui_pane,
+            "split-window",
+            "-h",
+            "-d",
+            "-p",
+            "70",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            &layout.tui_pane,
         ])
         .output()
         .context("Failed to create opencode pane")?;
@@ -177,10 +192,16 @@ pub fn ensure_right_panes(layout: &mut PaneLayout) -> Result<()> {
     // Bottom-right pane for CLI (30% of the right side)
     let output = Command::new("tmux")
         .args([
-            "split-window", "-v", "-d",
-            "-p", "30",
-            "-P", "-F", "#{pane_id}",
-            "-t", &opencode_pane,
+            "split-window",
+            "-v",
+            "-d",
+            "-p",
+            "30",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            &opencode_pane,
         ])
         .output()
         .context("Failed to create CLI pane")?;
@@ -216,11 +237,11 @@ pub fn ensure_right_panes(layout: &mut PaneLayout) -> Result<()> {
 // Switching features respawns both right panes with new attach commands.
 // The old inner sessions detach and keep running in the background.
 
-fn opencode_session_name(repo_name: &str, feature_name: &str) -> String {
+pub fn opencode_session_name(repo_name: &str, feature_name: &str) -> String {
     format!("oc-{}-{}-opencode", repo_name, feature_name)
 }
 
-fn cli_session_name(repo_name: &str, feature_name: &str) -> String {
+pub fn cli_session_name(repo_name: &str, feature_name: &str) -> String {
     format!("oc-{}-{}-cli", repo_name, feature_name)
 }
 
@@ -230,11 +251,7 @@ fn create_single_session(name: &str, working_dir: &str, cmd: Option<&str>) -> Re
         return Ok(());
     }
 
-    let mut args = vec![
-        "new-session", "-d",
-        "-s", name,
-        "-c", working_dir,
-    ];
+    let mut args = vec!["new-session", "-d", "-s", name, "-c", working_dir];
 
     if let Some(c) = cmd {
         args.push(c);
@@ -255,7 +272,11 @@ fn create_single_session(name: &str, working_dir: &str, cmd: Option<&str>) -> Re
 }
 
 /// Create both inner sessions for a feature.
-pub fn create_inner_sessions(repo_name: &str, feature_name: &str, worktree_path: &str) -> Result<()> {
+pub fn create_inner_sessions(
+    repo_name: &str,
+    feature_name: &str,
+    worktree_path: &str,
+) -> Result<()> {
     let oc_name = opencode_session_name(repo_name, feature_name);
     let cli_name = cli_session_name(repo_name, feature_name);
 
@@ -269,11 +290,7 @@ pub fn create_inner_sessions(repo_name: &str, feature_name: &str, worktree_path:
 fn attach_pane_to_session(pane_id: &str, session_name: &str) -> Result<()> {
     let cmd = format!("unset TMUX && exec tmux attach-session -t {}", session_name);
     let output = Command::new("tmux")
-        .args([
-            "respawn-pane", "-k",
-            "-t", pane_id,
-            "sh", "-c", &cmd,
-        ])
+        .args(["respawn-pane", "-k", "-t", pane_id, "sh", "-c", &cmd])
         .output()
         .context("Failed to attach pane to session")?;
 
@@ -291,9 +308,13 @@ pub fn show_feature(layout: &PaneLayout, repo_name: &str, feature_name: &str) ->
     let oc_session = opencode_session_name(repo_name, feature_name);
     let cli_session = cli_session_name(repo_name, feature_name);
 
-    let opencode_pane = layout.opencode_pane.as_ref()
+    let opencode_pane = layout
+        .opencode_pane
+        .as_ref()
         .context("Right panes not created yet")?;
-    let cli_pane = layout.cli_pane.as_ref()
+    let cli_pane = layout
+        .cli_pane
+        .as_ref()
         .context("Right panes not created yet")?;
 
     attach_pane_to_session(opencode_pane, &oc_session)?;
@@ -325,7 +346,10 @@ pub fn clear_feature(layout: &PaneLayout) -> Result<()> {
 
 /// Kill both inner sessions for a feature.
 pub fn kill_inner_sessions(repo_name: &str, feature_name: &str) -> Result<()> {
-    for name in [opencode_session_name(repo_name, feature_name), cli_session_name(repo_name, feature_name)] {
+    for name in [
+        opencode_session_name(repo_name, feature_name),
+        cli_session_name(repo_name, feature_name),
+    ] {
         if session_exists(&name) {
             let _ = Command::new("tmux")
                 .args(["kill-session", "-t", &name])
@@ -338,6 +362,26 @@ pub fn kill_inner_sessions(repo_name: &str, feature_name: &str) -> Result<()> {
 /// Check if a feature's inner sessions are alive (at least the opencode one).
 pub fn inner_sessions_alive(repo_name: &str, feature_name: &str) -> bool {
     session_exists(&opencode_session_name(repo_name, feature_name))
+}
+
+/// List all live tmux session names in a single subprocess call.
+/// Returns a `HashSet` for O(1) lookups.
+pub fn list_all_sessions() -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    if let Ok(output) = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if !line.is_empty() {
+                    set.insert(line.to_string());
+                }
+            }
+        }
+    }
+    set
 }
 
 /// Kill all inner sessions whose names start with the repo prefix.

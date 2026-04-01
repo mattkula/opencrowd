@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::git;
 use crate::model::{AppState, Feature, FeatureStatus};
 use crate::persist;
-use crate::status;
+use crate::status::{self, StatusContext};
 use crate::tmux::{self, PaneLayout};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +42,8 @@ pub struct App {
     pub tui_focused: bool,
     /// Status of the base repo entry.
     pub base_status: FeatureStatus,
+    /// Persistent status-detection context (DB connection + session cache).
+    pub status_ctx: StatusContext,
 }
 
 /// How often to poll feature statuses.
@@ -65,6 +67,7 @@ impl App {
             spinner_frame: 0,
             tui_focused: true,
             base_status: FeatureStatus::Idle,
+            status_ctx: StatusContext::new(),
         }
     }
 
@@ -129,11 +132,7 @@ impl App {
         }
 
         let repo_parent = git::repo_parent(&self.state.base_repo_path);
-        let feature = Feature::new(
-            name.clone(),
-            &self.state.repo_name,
-            &repo_parent,
-        );
+        let feature = Feature::new(name.clone(), &self.state.repo_name, &repo_parent);
 
         // Create the git worktree
         git::create_worktree(
@@ -231,10 +230,7 @@ impl App {
         self.delete_candidate = Some(self.selected_index);
         self.input_mode = InputMode::ConfirmDelete;
         if let Some(feature) = self.selected_feature() {
-            self.status_message = Some(format!(
-                "Delete feature '{}'? (y/n)",
-                feature.name
-            ));
+            self.status_message = Some(format!("Delete feature '{}'? (y/n)", feature.name));
         }
     }
 
@@ -265,10 +261,7 @@ impl App {
 
         // Ask about branch deletion
         self.input_mode = InputMode::ConfirmDeleteBranch;
-        self.status_message = Some(format!(
-            "Also delete branch '{}'? (y/n)",
-            feature.branch
-        ));
+        self.status_message = Some(format!("Also delete branch '{}'? (y/n)", feature.branch));
 
         Ok(())
     }
@@ -300,7 +293,11 @@ impl App {
 
         self.input_mode = InputMode::Normal;
         self.delete_candidate = None;
-        if self.status_message.as_ref().map_or(true, |m| !m.starts_with("Warning")) {
+        if self
+            .status_message
+            .as_ref()
+            .map_or(true, |m| !m.starts_with("Warning"))
+        {
             self.status_message = Some(format!("Deleted feature '{}'", name));
         }
 
@@ -309,11 +306,24 @@ impl App {
 
     /// Reconcile persisted state with actual worktrees/sessions on startup.
     pub fn reconcile(&mut self) {
+        // Single tmux call to get all live sessions.
+        let live_sessions = tmux::list_all_sessions();
+
+        // Collect all worktree paths and refresh the session cache.
+        let base_path = self.state.base_repo_path.clone();
+        let worktree_paths: Vec<String> = std::iter::once(base_path.clone())
+            .chain(self.state.features.iter().map(|f| f.worktree_path.clone()))
+            .collect();
+        let path_refs: Vec<&str> = worktree_paths.iter().map(|s| s.as_str()).collect();
+        self.status_ctx.refresh_session_cache(&path_refs);
+
         // Reconcile base
         self.base_status = status::detect_status(
             &self.state.repo_name,
             BASE_NAME,
-            &self.state.base_repo_path,
+            &base_path,
+            &live_sessions,
+            &self.status_ctx,
         );
 
         for feature in &mut self.state.features {
@@ -321,11 +331,14 @@ impl App {
                 &self.state.repo_name,
                 &feature.name,
                 &feature.worktree_path,
+                &live_sessions,
+                &self.status_ctx,
             );
         }
     }
 
     /// Poll feature statuses if enough time has elapsed since the last poll.
+    /// Also checks tmux pane focus (throttled to the same interval).
     /// Returns true if any status changed (caller should trigger a redraw).
     pub fn poll_statuses(&mut self) -> bool {
         if self.last_status_poll.elapsed() < STATUS_POLL_INTERVAL {
@@ -333,12 +346,33 @@ impl App {
         }
         self.last_status_poll = Instant::now();
 
+        // --- Batched tmux: single subprocess to list all live sessions ---
+        let live_sessions = tmux::list_all_sessions();
+
+        // --- Throttled pane-focus check (was previously every 250ms) ---
+        if let Some(ref layout) = self.layout {
+            self.tui_focused = tmux::is_pane_active(&layout.tui_pane);
+        }
+
+        // --- Refresh the session-ID cache if its TTL has elapsed ---
+        let base_path = self.state.base_repo_path.clone();
+        let worktree_paths: Vec<String> = std::iter::once(base_path.clone())
+            .chain(self.state.features.iter().map(|f| f.worktree_path.clone()))
+            .collect();
+        let path_refs: Vec<&str> = worktree_paths.iter().map(|s| s.as_str()).collect();
+        self.status_ctx.refresh_session_cache(&path_refs);
+
         let mut changed = false;
         let repo_name = self.state.repo_name.clone();
-        let base_path = self.state.base_repo_path.clone();
 
         // Poll base status
-        let new_base = status::detect_status(&repo_name, BASE_NAME, &base_path);
+        let new_base = status::detect_status(
+            &repo_name,
+            BASE_NAME,
+            &base_path,
+            &live_sessions,
+            &self.status_ctx,
+        );
         if self.base_status != new_base {
             self.base_status = new_base;
             changed = true;
@@ -349,6 +383,8 @@ impl App {
                 &repo_name,
                 &feature.name,
                 &feature.worktree_path,
+                &live_sessions,
+                &self.status_ctx,
             );
 
             if feature.status != new_status {
